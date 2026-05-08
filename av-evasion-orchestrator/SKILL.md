@@ -234,6 +234,12 @@ Phase 4: 恢复清理
 ```
 开始免杀任务
 │
+├─ 你知道目标 EDR 是什么吗？
+│   ├─ 是（CrowdStrike / SentinelOne / Defender / 卡巴）
+│   │   └─ → §9 EDR 差异化方案矩阵
+│   └─ 否
+│       └─ → 使用 §2 防御等级评估命令获取信息
+│
 ├─ 你处于什么阶段？
 │   ├─ 生成 payload / 编译工具
 │   │   └─ 需要静态免杀
@@ -290,7 +296,121 @@ Phase 4: 恢复清理
 
 ---
 
-## 9. 决策示例
+## 9. EDR 差异化方案矩阵
+
+通用免杀方案在不同 EDR 面前效果差异很大。以下是四大主流 EDR 的检测重点和针对性绕过策略：
+
+### 9.1 EDR 产品速识
+
+```powershell
+# 快速识别目标 EDR
+Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct |
+    Select-Object displayName, productState
+
+# 进程特征识别
+Get-Process | Where-Object {
+    $_.ProcessName -match "MsMpEng|Sense|CSFalcon|SentinelAgent|avp"
+} | Select-Object ProcessName, Id
+
+# 服务特征识别
+Get-Service | Where-Object {
+    $_.Name -match "WinDefend|Sense|CSFalcon|SentinelAgent|AVP"
+} | Select-Object Name, Status
+```
+
+### 9.2 四大 EDR 差异化方案
+
+| EDR | 检测强项 | 核心弱点 | 针对性绕过方案 |
+|---|---|---|---|
+| **CrowdStrike Falcon** | 行为序列分析、云端 AI 关联、进程链回溯 | 用户态 Hook 深度有限（仅关键 API）；对间接 syscall + 栈欺骗敏感 | ① Indirect syscall + CallStack Spoofing（伪造 ntdll 返回地址）② 避开 Falcon 重点监控的父子进程关系（不用 Office→cmd→powershell 链）③ 使用 Fiber 执行替代 CreateThread |
+| **SentinelOne** | 静态 ML + 行为双引擎、VSS 卷影保护、文件回滚 | 内核回调注册较 CS Falcon 少；对 C#/.NET 的静态特征检测偏重 | ① Donut 转 shellcode 避免 .NET 反射特征② 静态混淆（OLLVM）优先于动态对抗③ 利用 S1 对合法云服务 C2 检测较弱的特点 |
+| **Defender for Endpoint** | AMSI/ETW 深度集成、MAPS 云端 ML、ASR 攻击面缩减规则 | 已知绕过方法多；用户态防护为主；社区研究充分 | ① AMSI + ETW 双杀（硬件断点最佳）② WDAC 评估用 LOLBAS Chaining ③ 避开 ASR 规则触发的 Office/Adobe 子进程创建 |
+| **卡巴斯基** | System Watcher 行为序列、应用控制、启发式仿真深度大 | 性能开销大 → 仿真超时可绕过；对 Rust/Go 二进制分析耗时 | ① 延长执行延迟（超出卡巴仿真时限 ~60s）② ntdll Unhooking + Indirect Syscall ③ 使用 Rust/Go 编译增大二进制体积，耗尽沙箱时间④ 行为序列中插入合法 API 调用作噪声 |
+
+### 9.3 EDR 指纹识别 → 方案选择流程
+
+```
+检测到 EDR 进程/服务
+│
+├── CsFalconService / CSFalconContainer?
+│   └── 方案: 栈欺骗 + Fiber 执行 + 避开敏感进程链
+│
+├── SentinelAgent / SentinelHelperService?
+│   └── 方案: OLLVM 混淆 + Donut 转 shellcode + Cloud C2
+│
+├── MsMpEng + Sense (MDE)?
+│   └── 方案: AMSI/ETW 双杀 + LOLBAS Chaining + 避开 ASR
+│
+├── avp / avpui (Kaspersky)?
+│   └── 方案: Unhook ntdll + 延长延迟 + Rust/Go 编译
+│
+└── 未知 EDR / 多个共存?
+    └── 按 L4 硬化方案: BYOVD 致盲 → 敏感操作 → 恢复
+```
+
+---
+## 10. Windows 11 24H2/25H2 安全变化对免杀的系统性影响
+
+Win11 24H2 的安全架构升级对免杀的影响远超单点修补，是系统性的。以下按影响程度排序：
+
+### 10.1 五大安全变化及影响矩阵
+
+| 安全特性 | 启用条件 | 对免杀的影响 | 影响等级 | 应对方案 |
+|---|---|---|---|---|
+| **HVCI 默认强制** | 支持 VBS 的设备默认开启 | 未签名驱动无法加载 → BYOVD 直接报废；内核内存不可写 → 内核致盲失败 | ⚠️ 致命 | 回退用户态全链：AMSI+ETW+Unhook+PoolParty+Sleep Obfuscation |
+| **Smart App Control 增强** | Win11 SE / 新装 24H2 | 未签名/低信誉二进制直接拦截 → 连执行机会都没有 | ⚠️ 高 | ① 使用有效代码签名证书（EV 证书首选）② 利用有信誉的 LOLBin 链 ③ 钓鱼绕过（诱导用户手动允许） |
+| **ETW Threat Intel Provider** | Win11 24H2 默认 | 记录所有 syscall 调用栈、RWX 内存操作 → 间接 syscall 被记录 | ⚠️ 高 | ① Provider 级选择性禁用（§9.2.1）② 避免 RWX 内存 → 使用 RW→RX 分步修改 ③ 利用合法调用栈（Fiber/线程池） |
+| **Kernel Callback 完整性校验** | Win11 24H2+ | 定期校验 PsSetCreateProcessNotifyRoutine 等回调链表 → 篡改触发 BSOD | ⚠️ 高 | 不修改回调链表本身 → 改为修改回调函数指针指向空实现 |
+| **Credential Guard 默认** | Win11 24H2（部分 SKU） | LSASS 隔离在 VTL1 → 用户态无法 dump → Mimikatz 直接失效 | ⚠️ 致命 | ① 放弃 dump LSASS → 改用 Kerberos ticket (.kirbi) ② DPAPI 解密 ③ SAM/SECURITY 注册表提取 ④ 网络级凭证捕获（Responder/ntlmrelayx） |
+
+### 10.2 版本适配决策清单
+
+```
+目标 OS 版本?
+│
+├── Win10 / Win11 22H2-23H2
+│   └── 用户态 + 内核态方案全可用（前提：HVCI 未手动开启）
+│
+├── Win11 24H2
+│   ├── HVCI 开启 → 内核方案不可用 → 走用户态全链
+│   ├── Credential Guard 开启 → dump LSASS 不可用 → 改用 ticket/SAM
+│   ├── SAC 开启 → 需签名证书或 LOLBAS 链
+│   └── ETW Threat Intel → 需 Provider 级绕过
+│
+├── Win11 25H2 (预计 2025H2)
+│   └── 预计: Intel CET Shadow Stack 硬件强制 + KDP 范围扩大
+│       → ROP 链、栈欺骗直接失效
+│       → 应对: JOP/COP 替代 ROP、Signal-Oriented Programming
+│
+└── Windows Server 2025+
+    └── VBS/HVCI 默认开启（与 Win11 一致）+ WDAC 策略更严格
+```
+
+---
+## 11. 附录：C2 框架选型参考
+
+C2 框架直接影响免杀方案的选型和成本。以下为 2026 年主流框架对比：
+
+| 框架 | 语言 | 协议 | 免杀能力 | 生态 | 适合场景 |
+|---|---|---|---|---|---|
+| **Sliver** | Go | mTLS/HTTP/HTTPS/WireGuard/DNS | ★★★★ 原生 syscall、PPID 欺骗、Malleable Profile | 开源(BishopFox)、活跃社区 | 替代 CS 的首选，Go 编译天然免杀优势 |
+| **Havoc** | Python+C | HTTP/HTTPS/SMB | ★★★★ 集成 Shhhloader、多种注入、OLLVM 支持 | 开源、法语团队 | 中大型红队，需要多种注入方式切换 |
+| **Mythic** | Python+Go | HTTP/HTTPS/DNS/WebSocket | ★★★☆ 多语言 Agent（Apollo/Athena/Medusa）、自定义 C2 Profile | 开源、最活跃社区 | 需要高度定制的多平台操作 |
+| **Nighthawk** | C++ | HTTP/HTTPS | ★★★★★ 内置栈伪造、间接 syscall、ETW 补丁、内存加密 | 商业(MDSec)、$10K+/年 | 高对抗 L4 环境、APT 模拟 |
+| **Cobalt Strike** | Java+C | HTTP/HTTPS/DNS/SMB/TCP | ★★★★ UDRL 自定义、Malleable C2、Sleep 加密 | 商业(Fortra)、最大生态 | 传统红队首选，但被特征化严重 |
+| **Brute Ratel** | C/C++ | HTTP/HTTPS/DNS/SMB | ★★★★★ Badger Agent、直接 syscall、内存加密、无特征 | 商业、$2.5K+/年 | L3-L4 环境、需要高隐蔽性 |
+| **PoshC2** | Python+PS | HTTP/HTTPS | ★★★ AMSI 绕过、进程注入 | 开源 | 仅 PS/.NET 场景，Windows 渗透快攻 |
+
+### 与免杀方案的关联
+
+| C2 选择 | 推荐搭配的免杀链 | 原因 |
+|---|---|---|
+| Sliver / Havoc / Mythic（开源） | **标准链**: Donut→Stomping→PoolParty→ETW/AMSI | 开源 C2 的 beacon 特征更可能被标记，需更多的执行层绕过 |
+| Nighthawk / Brute Ratel（商业） | **轻量链**: syscall + 栈欺骗即可 | 商业 C2 内置免杀更完善，不需重型注入 |
+| Cobalt Strike | **标准链 + 签名规避**: 重点防静态特征 + 使用 UDRL | CS beacon 被几乎所有 EDR 特征化，静态免杀是第一步 |
+
+---
+## 12. 决策示例
 
 **场景**: L3 环境（CrowdStrike Falcon），Win11 22H2，管理员权限，需要 dump LSASS，HVCI 未启用。
 

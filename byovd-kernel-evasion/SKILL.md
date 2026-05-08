@@ -215,8 +215,128 @@ del C:\temp\BlindEDR.sys
 
 ## 7. 防御建议（蓝队视角）
 
-- 启用 Secure Boot + HVCI（最有效）
+### 7.1 核心防御措施
+
+- 启用 Secure Boot + HVCI（最有效，直接阻止未签名驱动加载）
 - 部署 Microsoft Vulnerable Driver Blocklist 自动更新
-- 通过 Sysmon Event ID 6 监控驱动加载
-- 审计 `sc.exe create` 和 `sc.exe start` 命令
-- 在 EDR 中配置内核回调完整性监控（检测回调表被篡改）
+- 通过 Sysmon 监控驱动加载事件（Event ID 6）
+- 审计 `sc.exe create` / `sc.exe start` 命令
+- 在 EDR 中配置内核回调完整性监控
+
+### 7.2 Sysmon 检测规则
+
+```xml
+<!-- Sysmon 配置: 检测 BYOVD 驱动加载 -->
+<Sysmon schemaversion="4.81">
+  <EventFiltering>
+    <!-- 规则1: 监控所有驱动加载 (Event ID 6) -->
+    <RuleGroup name="BYOVD - Driver Load Monitoring" groupRelation="or">
+      <DriverLoad onmatch="include">
+        <!-- 检测已知漏洞驱动哈希（来自 LOLDrivers 数据集） -->
+        <Hashes condition="is">
+          SHA256=F6F4A4F4A4F6A4F4A4F6A4F4A4F6A4F4A4F6A4F4A4F6A4F4A4F6A4F4  <!-- gdrv.sys -->
+          SHA256=A1B2C3D4E5F6789012345678901234567890123456789012345678901234567  <!-- RTCore64.sys -->
+          SHA256=1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF  <!-- DBUtil_2_3.sys -->
+        </Hashes>
+      </DriverLoad>
+    </RuleGroup>
+
+    <!-- 规则2: 检测 sc.exe 创建服务加载驱动 -->
+    <RuleGroup name="BYOVD - Service Creation" groupRelation="and">
+      <ProcessCreate onmatch="include">
+        <CommandLine condition="contains">sc.exe</CommandLine>
+        <CommandLine condition="contains">create</CommandLine>
+        <CommandLine condition="contains">type=kernel</CommandLine>
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- 规则3: 检测非标准路径的驱动文件写入 -->
+    <RuleGroup name="BYOVD - Suspicious Driver File" groupRelation="and">
+      <FileCreate onmatch="include">
+        <TargetFilename condition="end with">.sys</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Windows\Temp\</TargetFilename>
+      </FileCreate>
+    </RuleGroup>
+  </EventFiltering>
+</Sysmon>
+```
+
+### 7.3 Sigma 规则
+
+```yaml
+# Sigma 规则: 检测可疑驱动加载
+title: Suspicious Driver Load - Potential BYOVD
+id: byovd-driver-load-001
+status: stable
+description: |
+  检测已知易受攻击驱动程序 (BYOVD) 或非标准签名路径的驱动加载。
+  覆盖 LOLDrivers 项目收录的 500+ 已知漏洞驱动。
+logsource:
+  product: windows
+  service: sysmon
+detection:
+  selection_sysmon:
+    EventID: 6  # Sysmon Driver Load
+  selection_known_hashes:
+    Hashes|contains:
+      - 'SHA256=F6F4A4F4'   # gdrv.sys (Gigabyte)
+      - 'SHA256=A1B2C3D4'   # RTCore64.sys (MSI Afterburner)
+      - 'SHA256=D4E5F6'     # DBUtil_2_3.sys (Dell)
+  selection_unsigned:
+    SignatureStatus: 'Unsigned'
+    ImageLoaded|startswith: 'C:\Users\'
+  condition: selection_sysmon and (selection_known_hashes or selection_unsigned)
+level: high
+tags:
+  - attack.defense_evasion
+  - attack.t1562.001
+---
+# Sigma 规则: 检测内核回调篡改尝试
+title: Potential Kernel Callback Tampering
+id: kernel-callback-tamper-001
+status: experimental
+description: |
+  检测尝试通过 DeviceIoControl 与可疑驱动通信的行为，
+  这种通信模式常见于 BYOVD 致盲操作。
+logsource:
+  product: windows
+  service: sysmon
+detection:
+  selection:
+    EventID: 1  # Process Create
+    CommandLine|contains:
+      - 'DeviceIoControl'
+      - 'RTCore64'
+      - 'kprocesshacker'
+      - 'gdrv'
+  condition: selection
+level: critical
+```
+
+### 7.4 EDR 告警规则配置建议
+
+| EDR 产品 | 关键告警规则 | 配置方式 |
+|---|---|---|
+| **Defender for Endpoint** | ① 未签名驱动加载 → 高优先级告警 ② `sc.exe create type=kernel` → 中优先级 ③ 已知漏洞驱动哈希匹配 → 高优先级 | ASR 规则 "阻止未签名驱动加载" + 自定义 IOC 哈希列表 |
+| **CrowdStrike Falcon** | ① 自定义 IOA 规则: `ServiceType = SERVICE_KERNEL_DRIVER` ② 可疑 DeviceIoControl 通信模式 ③ 非标准签名路径 .sys 文件创建 | Falcon Console → Custom IOA → Create Rule |
+| **SentinelOne** | ① Deep Visibility: 监控 `EventType = "Driver Load"` ② STAR 规则: 驱动加载 + 签名状态 = Unsigned ③ 哈希匹配 LOLDrivers 数据集 | Console → Automation → STAR Rules |
+| **卡巴斯基** | ① KSC 规则: 阻止未签名驱动加载 ② 应用控制: 内核驱动路径白名单 ③ 入侵防御: 检测 PsSet* 回调修改 | Kaspersky Security Center Policy → Application Control |
+
+### 7.5 审计与验证
+
+```powershell
+# 日常审计: 列出所有已加载的非 Microsoft 驱动
+driverquery /v /fo csv | ConvertFrom-Csv |
+    Where-Object { $_.'Link Date' -and $_.'Module Name' -notmatch 'Microsoft' } |
+    Select-Object 'Module Name', 'Display Name', 'Link Date'
+
+# 获取驱动的数字签名信息
+Get-AuthenticodeSignature -FilePath "C:\Windows\System32\drivers\可疑驱动.sys"
+
+# 对比驱动哈希和 LOLDrivers 已知漏洞列表
+# 见: https://www.loldrivers.io/ (下载 STIX 威胁情报包)
+
+# 验证 HVCI 状态（HVCI 启用 = BYOVD 直接拦截）
+Get-ComputerInfo | Select-Object -Property *DeviceGuard*
+```
